@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -189,3 +191,56 @@ func TestSHA256Checksum(t *testing.T) {
 		t.Errorf("Expected hash %s, got %s", expectedHash, calculatedHash)
 	}
 }
+
+func TestServerEndpoints(t *testing.T) {
+	// 1. Test handleStatus
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	rr := httptest.NewRecorder()
+
+	handler := enableCORS(handleStatus)
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("handleStatus returned status %v, want %v", rr.Code, http.StatusOK)
+	}
+
+	if origin := rr.Header().Get("Access-Control-Allow-Origin"); origin != "*" {
+		t.Errorf("Access-Control-Allow-Origin is %q, want *", origin)
+	}
+
+	var statusMap map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&statusMap); err != nil {
+		t.Fatalf("failed to decode status response: %v", err)
+	}
+	if statusMap["status"] != "ok" {
+		t.Errorf("status response is %q, want 'ok'", statusMap["status"])
+	}
+
+	// 2. Test handleJobs
+	req = httptest.NewRequest("GET", "/api/jobs", nil)
+	rr = httptest.NewRecorder()
+
+	jobsHandler := enableCORS(handleJobs)
+	jobsHandler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("handleJobs returned status %v, want %v", rr.Code, http.StatusOK)
+	}
+
+	var jobsList []DownloadJob
+	if err := json.NewDecoder(rr.Body).Decode(&jobsList); err != nil {
+		t.Fatalf("failed to decode jobs list response: %v", err)
+	}
+
+	// 3. Test handleDownload (with missing/invalid body)
+	req = httptest.NewRequest("POST", "/api/download", bytes.NewBufferString("invalid json"))
+	rr = httptest.NewRecorder()
+
+	downloadHandler := enableCORS(handleDownload)
+	downloadHandler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("handleDownload with invalid JSON returned status %v, want %v", rr.Code, http.StatusBadRequest)
+	}
+}
+

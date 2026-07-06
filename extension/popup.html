@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Go Downloader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <header>
+      <div class="brand">
+        <img src="icon.png" alt="Logo" class="logo">
+        <h1>Go Downloader</h1>
+      </div>
+      <div class="status-badge" id="server-status">
+        <span class="dot"></span>
+        <span class="text">Connecting...</span>
+      </div>
+    </header>
+
+    <!-- Main Form -->
+    <main>
+      <div class="card form-card">
+        <div class="intercept-row">
+          <label class="switch-container">
+            <input type="checkbox" id="intercept-toggle" checked>
+            <span class="switch-label">Auto-intercept browser downloads</span>
+          </label>
+        </div>
+
+        <div class="input-group">
+          <label for="url">File URL</label>
+          <input type="text" id="url" placeholder="https://example.com/largefile.zip" autocomplete="off">
+        </div>
+
+
+        <div class="form-row">
+          <div class="input-group concurrency-group">
+            <label for="concurrency">Concurrency (<span id="concurrency-val">4</span>)</label>
+            <input type="range" id="concurrency" min="1" max="32" value="4">
+          </div>
+        </div>
+
+        <div class="input-group collapse-group">
+          <div class="collapse-header" id="advanced-toggle">
+            Advanced Settings <span class="arrow">&#9662;</span>
+          </div>
+          <div class="collapse-content id-advanced-content">
+            <label for="sha256">Expected SHA-256 Checksum</label>
+            <input type="text" id="sha256" placeholder="hex string..." autocomplete="off">
+          </div>
+        </div>
+
+        <button id="download-btn" class="btn primary-btn">
+          Start Download
+        </button>
+      </div>
+
+      <!-- Jobs Section -->
+      <section class="jobs-section">
+        <h2>Active Downloads</h2>
+        <div class="jobs-list" id="jobs-list">
+          <div class="empty-state">
+            <p>No active downloads</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

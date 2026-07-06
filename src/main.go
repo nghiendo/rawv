@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,89 +22,314 @@ import (
 	"time"
 )
 
-func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
+// DownloadJob represents the state of a single download task
+type DownloadJob struct {
+	ID         string `json:"id"`
+	URL        string `json:"url"`
+	OutPath    string `json:"out_path"`
+	Size       int64  `json:"size"`
+	Downloaded int64  `json:"downloaded"`
+	Status     string `json:"status"` // "downloading", "completed", "failed", "cancelled"
+	Error      string `json:"error,omitempty"`
+	Speed      int64  `json:"speed"` // bytes per second
+	SHA256     string `json:"sha256,omitempty"`
+	cancelFunc context.CancelFunc
 }
 
-func run() error {
-	urlFlag := flag.String("url", "", "The URL of the file to download (required)")
+var (
+	jobs   = make(map[string]*DownloadJob)
+	jobsMu sync.RWMutex
+)
+
+func main() {
+	serverFlag := flag.Bool("server", false, "Run in local HTTP API server mode")
+	portFlag := flag.Int("port", 8321, "Port for the HTTP API server (default 8321)")
+
+	// CLI-specific flags
+	urlFlag := flag.String("url", "", "The URL of the file to download (required in CLI mode)")
 	outFlag := flag.String("out", "", "Output file path (optional)")
 	concurrencyFlag := flag.Int("c", 4, "Number of concurrent download connections")
 	sha256Flag := flag.String("sha256", "", "Expected SHA-256 hash for integrity check (optional)")
 
 	flag.Parse()
 
-	if *urlFlag == "" {
+	if *serverFlag || *urlFlag == "" {
+		if err := runServer(*portFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "Server Error: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		if err := runCLI(*urlFlag, *outFlag, *concurrencyFlag, *sha256Flag); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+func runCLI(urlStr, outPath string, concurrency int, expectedSHA string) error {
+	if urlStr == "" {
 		flag.Usage()
 		return errors.New("URL is required (use -url <url>)")
 	}
 
-	urlStr := *urlFlag
-	if _, err := url.ParseRequestURI(urlStr); err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
-	}
-
-	concurrency := *concurrencyFlag
-	if concurrency <= 0 {
-		return errors.New("concurrency must be greater than 0")
-	}
-
-	// Handle system signals for clean cancellation
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Clone default transport to customize timeout behaviors
+	fmt.Println("Checking server range support...")
+	onProgress := func(downloaded, total, speed float64) {
+		drawProgressBar(int64(downloaded), int64(total), speed)
+	}
+
+	actualSHA, err := downloadFile(ctx, urlStr, outPath, concurrency, expectedSHA, onProgress)
+	fmt.Println() // Print newline after progress bar completes
+
+	if err != nil {
+		return err
+	}
+
+	if expectedSHA != "" {
+		expected := strings.ToLower(strings.TrimSpace(expectedSHA))
+		if actualSHA == expected {
+			fmt.Println("Checksum verification: SUCCESS (Matches expected value)")
+		} else {
+			return fmt.Errorf("checksum verification: FAILED (Expected: %s, Got: %s)", expected, actualSHA)
+		}
+	}
+
+	return nil
+}
+
+func runServer(port int) error {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/status", enableCORS(handleStatus))
+	mux.HandleFunc("/api/download", enableCORS(handleDownload))
+	mux.HandleFunc("/api/jobs", enableCORS(handleJobs))
+	mux.HandleFunc("/api/jobs/cancel", enableCORS(handleCancelJob))
+	mux.HandleFunc("/api/select-folder", enableCORS(handleSelectFolder))
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	// Start server in background
+	go func() {
+		fmt.Printf("Go Downloader Server starting on http://%s\n", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "Server Error: %v\n", err)
+		}
+	}()
+
+	// Start tray icon loop (blocks until exit)
+	startSystray(func() {
+		// Shutdown the HTTP server gracefully
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	})
+
+	return nil
+}
+
+func enableCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func handleSelectFolder(w http.ResponseWriter, r *http.Request) {
+	path, err := selectFolderDialog()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"path": path})
+}
+
+func handleJobs(w http.ResponseWriter, r *http.Request) {
+	jobsMu.RLock()
+	defer jobsMu.RUnlock()
+
+	list := make([]*DownloadJob, 0, len(jobs))
+	for _, job := range jobs {
+		list = append(list, job)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+type DownloadRequest struct {
+	URL         string `json:"url"`
+	Out         string `json:"out"`
+	Concurrency int    `json:"concurrency"`
+	SHA256      string `json:"sha256"`
+}
+
+func handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req DownloadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.URL == "" {
+		http.Error(w, "URL is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Concurrency <= 0 {
+		req.Concurrency = 4
+	}
+
+	jobID := strconv.FormatInt(time.Now().UnixNano(), 36)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	job := &DownloadJob{
+		ID:         jobID,
+		URL:        req.URL,
+		OutPath:    req.Out,
+		Status:     "downloading",
+		SHA256:     req.SHA256,
+		cancelFunc: cancel,
+	}
+
+	jobsMu.Lock()
+	jobs[jobID] = job
+	jobsMu.Unlock()
+
+	// Start downloader in background
+	go func() {
+		onProgress := func(downloaded, total, speed float64) {
+			jobsMu.Lock()
+			job.Downloaded = int64(downloaded)
+			job.Size = int64(total)
+			job.Speed = int64(speed)
+			jobsMu.Unlock()
+		}
+
+		actualSHA, err := downloadFile(ctx, req.URL, req.Out, req.Concurrency, req.SHA256, onProgress)
+
+		jobsMu.Lock()
+		defer jobsMu.Unlock()
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				job.Status = "cancelled"
+				job.Error = "Download cancelled by user"
+			} else {
+				job.Status = "failed"
+				job.Error = err.Error()
+			}
+		} else {
+			job.Status = "completed"
+			job.Speed = 0
+			// Validate checksum if provided
+			if req.SHA256 != "" {
+				expected := strings.ToLower(strings.TrimSpace(req.SHA256))
+				if actualSHA == expected {
+					job.Status = "completed"
+				} else {
+					job.Status = "failed"
+					job.Error = fmt.Sprintf("checksum mismatch: expected %s, got %s", expected, actualSHA)
+				}
+			}
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(job)
+}
+
+func handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "Missing job id parameter", http.StatusBadRequest)
+		return
+	}
+
+	jobsMu.Lock()
+	job, exists := jobs[id]
+	jobsMu.Unlock()
+
+	if !exists {
+		http.Error(w, "Job not found", http.StatusNotFound)
+		return
+	}
+
+	if job.cancelFunc != nil {
+		job.cancelFunc()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "cancelled", "id": id})
+}
+
+// downloadFile contains the core concurrent chunk downloading logic
+func downloadFile(ctx context.Context, urlStr, outPath string, concurrency int, expectedSHA string, onProgress func(downloaded, total, speed float64)) (string, error) {
+	if _, err := url.ParseRequestURI(urlStr); err != nil {
+		return "", fmt.Errorf("invalid URL: %w", err)
+	}
+
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 15 * time.Second
 	client := &http.Client{
 		Transport: transport,
 	}
 
-	fmt.Println("Checking server range support...")
 	supportsRange, contentLength, filename, err := checkRangeSupport(ctx, client, urlStr)
 	if err != nil {
-		return fmt.Errorf("failed to check range support: %w", err)
+		return "", fmt.Errorf("failed to check range support: %w", err)
 	}
 
-	outPath := *outFlag
-	if outPath == "" {
+	if outPath != "" {
+		if fi, err := os.Stat(outPath); err == nil && fi.IsDir() {
+			outPath = filepath.Join(outPath, filename)
+		} else if strings.HasSuffix(outPath, string(filepath.Separator)) || strings.HasSuffix(outPath, "/") {
+			outPath = filepath.Join(outPath, filename)
+		}
+	} else {
 		outPath = filename
-	}
-
-	if contentLength > 0 {
-		fmt.Printf("File size: %s\n", formatBytes(contentLength))
-	} else {
-		fmt.Println("File size: Unknown")
-	}
-
-	if supportsRange {
-		fmt.Printf("Range requests: Supported. Concurrency: %d\n", concurrency)
-	} else {
-		fmt.Println("Range requests: Not supported. Falling back to single-threaded download.")
-		concurrency = 1
 	}
 
 	// Create directories if necessary
 	dir := filepath.Dir(outPath)
 	if dir != "." && dir != "/" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create output directory: %w", err)
+			return "", fmt.Errorf("failed to create output directory: %w", err)
 		}
+	}
+
+	if !supportsRange {
+		concurrency = 1
 	}
 
 	tmpPath := outPath + ".tmp"
 	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
 	defer tmpFile.Close()
 
 	if supportsRange && contentLength > 0 {
 		if err := tmpFile.Truncate(contentLength); err != nil {
-			return fmt.Errorf("failed to pre-allocate temp file size: %w", err)
+			return "", fmt.Errorf("failed to pre-allocate temp file size: %w", err)
 		}
 	}
 
@@ -143,7 +369,9 @@ func run() error {
 				lastDownloaded = current
 				lastTime = now
 
-				drawProgressBar(current, contentLength, speed)
+				if onProgress != nil {
+					onProgress(float64(current), float64(contentLength), speed)
+				}
 
 			case <-progressCtx.Done():
 				current := atomic.LoadInt64(&totalDownloaded)
@@ -152,8 +380,9 @@ func run() error {
 				if overallElapsed > 0 {
 					avgSpeed = float64(current) / overallElapsed
 				}
-				drawProgressBar(current, contentLength, avgSpeed)
-				fmt.Println()
+				if onProgress != nil {
+					onProgress(float64(current), float64(contentLength), avgSpeed)
+				}
 				return
 			}
 		}
@@ -196,7 +425,6 @@ func run() error {
 
 		wg.Wait()
 	} else {
-		// Single thread sequential fallback
 		downloadSequential(workerCtx, client, urlStr, tmpFile, &totalDownloaded, setError)
 	}
 
@@ -204,40 +432,25 @@ func run() error {
 	<-progressDone
 
 	if firstErr != nil {
-		return fmt.Errorf("download failed: %w", firstErr)
+		return "", fmt.Errorf("download failed: %w", firstErr)
 	}
 
-	// Success: close and rename temp file to final output
 	tmpFile.Close()
 	if err := os.Rename(tmpPath, outPath); err != nil {
-		return fmt.Errorf("failed to rename temp file to destination: %w", err)
+		return "", fmt.Errorf("failed to rename temp file to destination: %w", err)
 	}
 	downloadSuccess = true
 
-	fmt.Printf("Download complete. File saved to: %s\n", outPath)
-
 	// Checksum calculation
-	fmt.Println("Calculating SHA-256 checksum...")
-	checksum, err := calculateSHA256(outPath)
+	actualSHA, err := calculateSHA256(outPath)
 	if err != nil {
-		return fmt.Errorf("failed to calculate checksum: %w", err)
-	}
-	fmt.Printf("Calculated SHA-256: %s\n", checksum)
-
-	if *sha256Flag != "" {
-		expected := strings.ToLower(strings.TrimSpace(*sha256Flag))
-		if checksum == expected {
-			fmt.Println("Checksum verification: SUCCESS (Matches expected value)")
-		} else {
-			return fmt.Errorf("checksum verification: FAILED (Expected: %s, Got: %s)", expected, checksum)
-		}
+		return "", fmt.Errorf("failed to calculate checksum: %w", err)
 	}
 
-	return nil
+	return actualSHA, nil
 }
 
 func checkRangeSupport(ctx context.Context, client *http.Client, urlStr string) (supportsRange bool, contentLength int64, filename string, err error) {
-	// 1. Try HEAD request first
 	req, err := http.NewRequestWithContext(ctx, "HEAD", urlStr, nil)
 	if err == nil {
 		resp, err := client.Do(req)
@@ -254,7 +467,6 @@ func checkRangeSupport(ctx context.Context, client *http.Client, urlStr string) 
 		}
 	}
 
-	// 2. Fallback: try GET request with Range: bytes=0-0
 	req, err = http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 	if err != nil {
 		return false, -1, "", err
